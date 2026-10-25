@@ -1,0 +1,16 @@
+{
+  "name": "effect-cluster-repro-main",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@effect/platform-node": "file:../../.build/main/effect-platform-node-4.0.6.tgz",
+    "@effect/platform-node-shared": "file:../../.build/main/effect-platform-node-shared-4.0.6.tgz",
+    "@effect/sql-pg": "file:../../.build/main/effect-sql-pg-4.0.6.tgz",
+    "effect": "file:../../.build/main/effect-4.0.6.tgz",
+    "pg": "8.23.1"
+  },
+  "overrides": {
+    "@effect/platform-node-shared": "$@effect/platform-node-shared",
+    "effect": "$effect"
+  }
+}

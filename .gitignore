@@ -1,0 +1,5 @@
+node_modules/
+.build/
+logs/
+variants/*/src/
+variants/*/package-lock.json
