@@ -1,135 +1,163 @@
 # Effect Cluster reproductions
 
-Six scripts, one per issue. Each runs real runner processes
-(`NodeClusterSocket.layer` with `SqlMessageStorage` and `SqlRunnerStorage` on
-PostgreSQL). Each script prints timestamped logs from the runners (shard
-assignments, registration, shutdown) and from itself (pg_locks samples, message
-rows). It ends with the expected result, the actual result, and `PASS` or
-`FAIL`, and exits with 1 when the bug reproduces.
+Five bugs in Effect Cluster on PostgreSQL, plus one measurement. Each has its
+own script. Every script starts real runner processes that use
+`NodeClusterSocket.layer`, `SqlMessageStorage` and `SqlRunnerStorage`, prints
+the runners' logs, and ends with what it expected, what happened, and `PASS`
+or `FAIL`. A script exits with 1 when it reproduces its bug.
 
-## Versions
+All five bugs reproduce on effect 4.0.6 and on current `main`.
 
-| Build | What |
-| --- | --- |
-| release | `effect`, `@effect/sql-pg`, `@effect/platform-node` 4.0.6 from npm (the latest release) |
-| main | Effect-TS/effect `main` at `837e906d9a476bff12fbd063d1635f748e1de7de` (2026-10-25), built and packed by `scripts/build-main.sh` |
+| # | Issue | 4.0.6 | main |
+| --- | --- | --- | --- |
+| 1 | A workflow replay picks a different winner for a race it already recorded | FAIL | FAIL |
+| 2 | A workflow interrupted during shutdown stays Suspended forever | FAIL | FAIL |
+| 3 | A runner that lost its shard can still write replies | FAIL | FAIL |
+| 4 | A frozen runner keeps its shards forever | FAIL | FAIL |
+| 5 | Runners that join one after another move the same shard several times | FAIL | FAIL |
+| 6 | How long a shard pauses after SIGTERM | measured | measured |
 
-Node 24 runs the `.ts` files directly. PostgreSQL 17 runs in Docker.
-
-## Setup
+## Run it
 
 ```sh
-docker compose up -d          # PostgreSQL on 127.0.0.1:55642
+docker compose up -d          # PostgreSQL 17 on 127.0.0.1:55642
 npm install
-./run-all.sh                  # release; full logs in logs/stock/
-scripts/build-main.sh         # clones Effect, builds main into .build/main (needs pnpm)
-./run-all.sh main             # full logs in logs/main/
+./run-all.sh                  # effect 4.0.6, logs in logs/stock/
+scripts/build-main.sh         # clones and builds Effect main into .build/main, needs pnpm
+./run-all.sh main             # logs in logs/main/
 docker compose down -v
 ```
 
-To run one script: `node src/issue3-stale-owner-writes.ts`. `REPRO_DATABASE_URL`
-overrides the database. Each script drops and recreates the database named in
-that URL (`repro` by default), so point it only at a scratch server. The
-scripts use ports 34431 to 34462.
+Run one script with `node src/issue3-stale-owner-writes.ts`. Node 24 runs the
+`.ts` files directly.
 
-The scripts use short lock timings (`shardLockExpiration` 5 s, refresh 1 s,
-`refreshAssignmentsInterval` 500 ms) and 2 to 24 shards. They are in
-`baseConfig` in `src/lib.ts`.
+Each script drops and recreates its database. The default is `repro` on the
+Docker Postgres above. `REPRO_DATABASE_URL` points the scripts at another
+database, and that database gets dropped too, so only use a scratch server.
+The runners listen on ports 34431 to 34462.
 
-## Results
+The scripts use short timings so they finish fast. The shard lock expires
+after 5 s, runners refresh it every 1 s and reread assignments every 500 ms.
+They use 2 to 24 shards. All of this is in `baseConfig` in `src/lib.ts`.
 
-| # | Issue | release 4.0.6 | main 837e906 |
-| --- | --- | --- | --- |
-| 1 | Replay decides a recorded race again after a handoff | FAIL: `Complete("text")`, ran `claim` | FAIL: same |
-| 2 | Run interrupted at shutdown stays Suspended | FAIL: Suspended 20 s after B owns the shards, replied=2 unprocessed=0 | FAIL: same |
-| 3 | Stale owner still writes after losing its shard | FAIL: A's reply stored, client gets `"A"` | FAIL: same |
-| 4 | Frozen runner's advisory locks never expire | FAIL: B holds 6/12 shards after 30 s frozen | FAIL: same |
-| 5 | Runners joining one at a time move shards more than once | FAIL: 18 moved, 7 moved 2 or 3 times | FAIL: same |
-| 6 | Shard-move pause after SIGTERM | PASS: idle entity waits under 1 s; busy shard held for the full timeout (see below) | PASS: same |
+Builds tested:
 
-## Issues
+- **4.0.6.** `effect`, `@effect/sql-pg` and `@effect/platform-node` 4.0.6 from npm.
+- **main.** Effect-TS/effect at `837e906d9a476bff12fbd063d1635f748e1de7de`, 2026-10-25, built by `scripts/build-main.sh`.
 
-**1. A workflow replay decides a recorded race again after a shard handoff.**
-`src/issue1-race-replay.ts`. A workflow runs `DurableDeferred.raceAll` over an
-external deferred (`gate`) and a one-hour `DurableClock.sleep`. It then runs
-activity `claim` if the gate won or `close` if the clock won. Runner A suspends
-the run and stops. Runner B takes the shards, the gate is completed, and B's
-replay pauses before the race. The script then stores the race result `idle`
-in the same form the engine uses: a `deferred` request `raceAll/wait`, copied
-from the engine's own `gate` row. A previous owner leaves this row when it has
-persisted its clock result but stops before processing it. The script writes
-the row directly because that timing is hard to hit on demand. On replay,
-`deferredResult` reads only processed replies. B does not see the stored
-result, races again, and the gate wins. The durable workflow takes a different
-branch from the one already recorded, and its history holds both results.
-Expected: `Complete("idle")`, activities `[close/1]`. Actual:
-`Complete("text")`, activities `[claim/1]`, while the stored `raceAll/wait` row
-says `idle`.
+## The issues
 
-**2. A run interrupted at shutdown stays Suspended forever.**
-`src/issue2-interrupted-run-parked.ts`. The workflow races its first activity
-against an external deferred. On runner A the body waits until
-`Sharding.isShutdown` is true and then starts the activity. A has received
-SIGTERM while the run starts its first activity. The interrupted race reads as
-parked, so the run's reply is saved as `Suspended`. No deferred or clock will
-wake it. After A exits, storage holds `run` replied `Suspended` and
-`activity/step/1` unprocessed. Runner B takes the shards and answers the
-activity request with `Suspended` too. The run then has `replied=2
-unprocessed=0` and never moves. Expected: the run completes on B
-(`Complete("done")`). Actual: still `Suspended` 20 s after B owns the shards.
-A rolling deploy can strand runs this way.
+### 1. A workflow replay picks a different winner for a race it already recorded
 
-**3. No write fencing: a stale owner still writes after losing its shard.**
-`src/issue3-stale-owner-writes.ts`. Runner A starts a persisted request whose
-handler waits on a gate. A is frozen (SIGSTOP), and its advisory-lock backend
-is ended with `pg_terminate_backend`, as a network partition would end it.
-Runner B acquires every shard and starts the same request. A is resumed with
-its gate open and finishes first. Shard ownership is checked only in memory,
-so storage accepts A's reply. Two runners ran the request, and the kept reply
-came from the runner that no longer owns the shard. Expected: A's reply is
-rejected, and the stored reply and the client's result come from B. Actual:
-once A finishes, the row holds `{"_tag":"Success","value":"A"}` before B's
-handler returns. The client receives `"A"`, and B's later reply is dropped.
+`src/issue1-race-replay.ts`
 
-**4. A frozen runner's advisory-lock session never expires, so its shards
-never move.** `src/issue4-frozen-runner-locks.ts`. Two runners split 12
-shards. A is stopped with SIGSTOP for 30 s (`FREEZE_SECONDS`), which is six
-lock expirations. About 5 s after the freeze, B drops A from the healthy
-runners and assigns itself all 12 shards (B logs `New shard assignments` with
-12 shards). A's advisory locks belong to A's Postgres session, which stays open
-and idle, so B can never acquire them. The script samples `pg_locks` every
-second, and every sample from the freeze to the end shows each session holding
-6 locks. A paused VM, a long GC stop, or a host that loses its network while
-its TCP session stays up blocks those shards until the session ends. Expected:
-B holds all 12 locks about `shardLockExpiration` (5 s) after the freeze.
-Actual: B holds 6/12 after 30 s.
+A workflow races an external deferred called `gate` against a one-hour
+`DurableClock.sleep` with `DurableDeferred.raceAll`. If the gate wins it runs
+activity `claim`. If the clock wins it runs `close`.
 
-**5. Runners joining one at a time move shards more than once.**
-`src/issue5-join-moves.ts`. Runner A holds 24 shards, and B, C and D join
-1.5 s apart. The script samples each shard's owner from `pg_locks` every 25 ms.
-Every join recomputes the assignments, so a shard that went to B on its join
-moves on to C or D on the next join. Each extra move drains and reloads that
-shard's entities again during a single scale-out. Effect has no setting to
-prevent this. Expected: each shard moves at most once. Actual (release and main): 18 shards
-moved, and 7 of them moved more than once. Shards 9 and 22 went
-`A->B->C->D`, and shards 6, 11, 14, 18 and 19 moved twice.
+The race result is already stored as `idle`, the clock's answer. Then the
+shard moves to runner B and the gate completes. B replays the workflow, and
+`deferredResult` only reads processed replies, so B never sees the stored
+result. It runs the race again, the gate wins this time, and B runs `claim`.
+The workflow now has two different results for one race in its history and
+ran the branch it should not have.
 
-**6. Shard-move pause after SIGTERM.** `src/issue6-shard-move-pause.ts`.
+Expected `Complete("idle")` after running `close`. Got `Complete("text")`
+after running `claim`.
+
+The script writes the stored race row itself, as a copy of the engine's own
+`gate` row. In real use, a runner leaves this row behind when it saves the
+race result and stops before processing it. That timing is hard to hit on
+demand, so the script sets it up directly.
+
+### 2. A workflow interrupted during shutdown stays Suspended forever
+
+`src/issue2-interrupted-run-parked.ts`
+
+Runner A gets SIGTERM just as a workflow starts its first activity. The
+script makes this happen every time: the workflow waits until
+`Sharding.isShutdown` is true, then starts the activity.
+
+Shutdown interrupts the activity. The engine reads that interruption as a
+normal suspend and stores `Suspended` as the workflow's reply. Nothing will
+ever wake it, since it is not waiting on a deferred or a clock. Runner B takes
+the shard, sees the activity request, and answers it with `Suspended` as well.
+The workflow is stuck.
+
+Expected the workflow to finish on B with `Complete("done")`. Got `Suspended`
+20 s after B took the shard. Any rolling deploy can strand workflows like this.
+
+### 3. A runner that lost its shard can still write replies
+
+`src/issue3-stale-owner-writes.ts`
+
+Runner A starts a request whose handler waits on a gate. The script freezes A
+with SIGSTOP and kills its Postgres lock connection with
+`pg_terminate_backend`, the way a network partition would. Runner B takes
+every shard and starts the same request.
+
+Then A wakes up, its gate opens, and it finishes first. A only checks shard
+ownership in memory, and storage does not check it at all, so storage accepts
+A's reply. The client gets A's result and B's reply is dropped. Two runners
+handled the same request, and the one that won no longer owned the shard.
+
+Expected storage to reject A's reply and the client to get B's result. Got
+`"A"`.
+
+### 4. A frozen runner keeps its shards forever
+
+`src/issue4-frozen-runner-locks.ts`
+
+Two runners split 12 shards. The script freezes runner A with SIGSTOP for
+30 s, six times the 5 s lock expiration.
+
+About 5 s in, B marks A as unhealthy and assigns itself all 12 shards. It
+never gets them. A's shard locks are Postgres advisory locks held by A's
+database session, and that session stays open while A is frozen. The 5 s
+lock expiration does not release them. They stay held until the session
+ends. The script samples `pg_locks`
+every second, and A still holds its 6 locks at the end.
+
+Expected B to hold all 12 shards about 5 s after the freeze. Got 6 of 12
+after 30 s. A paused VM, a long GC pause, or a host that loses its network
+while its TCP connection stays up can block shards like this for as long as
+the session lives.
+
+### 5. Runners that join one after another move the same shard several times
+
+`src/issue5-join-moves.ts`
+
+Runner A holds 24 shards. Runners B, C and D join 1.5 s apart, about how a
+platform starts new instances during a scale-out. The script checks each
+shard's owner in `pg_locks` every 25 ms.
+
+Every join reassigns the shards. A shard that moved to B when B joined moves
+again to C or D when they join. Each move stops that shard's entities and
+starts them again somewhere else, so one scale-out restarts them two or three
+times. No setting prevents this.
+
+Expected every shard to move at most once. Got 18 shards moved, 7 of them more
+than once. Shards 9 and 22 went A to B to C to D.
+
+### 6. How long a shard pauses after SIGTERM
+
+`src/issue6-shard-move-pause.ts`
+
+This one is a measurement, not a bug. The script passes on both builds.
+
 Runners A and B split 4 shards. On A, entity `busy` runs a 60 s handler on one
-shard. Entity `idle`, on another shard, has handled one `Ping`. A receives
-SIGTERM, and the client immediately pings `idle` again. Results with
-`entityTerminationTimeout` at 2 s and 8 s:
+shard, and entity `idle` sits on another shard. A gets SIGTERM, and the client
+pings `idle` right away.
 
-| build | timeout | idle shard released / acquired by B | busy shard released / acquired by B | Ping to the idle entity waited |
+| build | `entityTerminationTimeout` | idle shard released, taken by B | busy shard released, taken by B | ping to `idle` waited |
 | --- | --- | --- | --- | --- |
-| release | 2 s | 0.45 s / 0.74 s | 2.01 s / 2.75 s | 0.74 s |
-| release | 8 s | 0.51 s / 0.77 s | 8.02 s / 8.82 s | 0.77 s |
-| main | 2 s | 0.45 s / 0.76 s | 2.03 s / 2.76 s | 0.74 s |
-| main | 8 s | 0.51 s / 0.80 s | 8.01 s / 8.84 s | 0.79 s |
+| 4.0.6 | 2 s | 0.45 s, 0.74 s | 2.01 s, 2.75 s | 0.74 s |
+| 4.0.6 | 8 s | 0.51 s, 0.77 s | 8.02 s, 8.82 s | 0.77 s |
+| main | 2 s | 0.45 s, 0.76 s | 2.03 s, 2.76 s | 0.74 s |
+| main | 8 s | 0.51 s, 0.80 s | 8.01 s, 8.84 s | 0.79 s |
 
-The release already releases the idle shard promptly, so a message to an idle
-entity on a moved shard waits under 1 s at either timeout. Only the shard with
-the in-flight handler is held, for the full `entityTerminationTimeout`, and
-every entity on that shard waits with it. The script's criterion is a Ping
-under 1.5 s at both timeouts, and it passes. It reports the busy shard's pause,
-which equals the timeout, but does not judge it. Main measures the same.
+A shard with only idle entities moves in under a second. A shard with a
+handler still running stays on A for the full `entityTerminationTimeout`, and
+every other entity on that shard waits with it. The script only checks that
+the ping to `idle` takes under 1.5 s. It reports the busy shard's pause but
+does not judge it.
